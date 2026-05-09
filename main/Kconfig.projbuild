@@ -1,0 +1,53 @@
+menu "HoneyMist Nano"
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        SSID used by the honeypot station interface.
+
+config WIFI_PASSWORD
+    string "WiFi password"
+    default ""
+    help
+        WPA2 password used by the honeypot station interface.
+
+config HUB_URL
+    string "HoneyOpus hub URL"
+    default ""
+    help
+        Base hub origin, for example https://honeyopus.ka.st .
+
+config HUB_TOKEN
+    string "HoneyOpus hub token"
+    default ""
+    help
+        Bearer token issued by the HoneyOpus hub for this honeypot.
+
+config IP_COOLDOWN_SECONDS
+    int "IP Cooldown (seconds)"
+    default 180
+    help
+        Time to wait before allowing a new connection from the same IP (prevents flooding).
+
+config OTX_ENABLED
+    bool "Enable AlienVault OTX reporting"
+    default n
+    help
+        If enabled, reports attacker IPs to AlienVault OTX.
+
+config OTX_API_KEY
+    string "AlienVault OTX API Key"
+    default ""
+    depends on OTX_ENABLED
+    help
+        Your AlienVault OTX API key.
+
+config OTX_PULSE_NAME
+    string "OTX Pulse Name"
+    default "HoneyMistNano Captures"
+    depends on OTX_ENABLED
+    help
+        Name for the OTX pulse where indicators will be added.
+
+endmenu
