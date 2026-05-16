@@ -10,6 +10,10 @@ This repository was vibe coded with the idea to see if another AI could do a min
 
 HoneyMistNano simulates a **generic embedded IoT appliance** environment, specifically targeting the common administrative interfaces of networked surveillance equipment and video recorders. It captures credentials, commands, and full session transcripts (asciinema-compatible) and reports them to a **HoneyMire Hub** instance.
 
+Hub reporting follows the canonical
+[`honeymire.attack/v1` protocol](https://github.com/HoneyMire/HoneyMire-Protocol),
+shared by HoneyMire sensors and first-party client libraries.
+
 ## ✨ Features
 
 - **Embedded Environment Simulation:** Mimics a BusyBox-based shell typical of many networked appliances, complete with common IoT vulnerabilities.
