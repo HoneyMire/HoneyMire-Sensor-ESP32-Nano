@@ -1,4 +1,4 @@
-# HoneyMistNano
+# HoneyMir-Sensor-ESP32-Nano
 
 A lightweight, visually interactive Telnet honeypot for the **ESP32-C3 SuperMini**. 
 
