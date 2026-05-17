@@ -85,7 +85,34 @@ typedef struct {
     size_t command_count;
     size_t total_command_bytes;
     char *commands[MAX_SESSION_COMMANDS];
+    // Hub protocol §3.4.8/§3.4.10. Per-direction wire byte counts and a
+    // running response-time mean across every (input → output) event pair.
+    // Counted unconditionally — survives event-cap truncation since the
+    // counters track what actually crossed the socket, not what we kept.
+    uint64_t bytes_in;
+    uint64_t bytes_out;
+    int64_t  last_input_us;
+    uint64_t response_sum_ms;
+    uint32_t response_pairs;
+    // §3.4.9 / §3.4 connect_count. The telnet listener doesn't have a
+    // banner concept, but we keep the slot for future protocol handlers
+    // that do.
+    char     client_banner[MAX_CAPTURE_FIELD_LEN];
+    uint32_t connect_count;
+    // §3.4.11 — populated from command_summary in finalize.
+    char *cve_refs[8];
+    size_t cve_ref_count;
 } telnet_session_t;
+
+// Per-IP pre-session probe counter. Bumped when the cooldown gate rejects
+// an accept; drained onto the session that finally gets through.
+typedef struct {
+    char ip[INET6_ADDRSTRLEN];
+    uint32_t probes;
+} ip_probe_entry_t;
+#define IP_PROBE_ENTRIES 64
+static SemaphoreHandle_t s_ip_probe_mutex;
+static ip_probe_entry_t s_ip_probes[IP_PROBE_ENTRIES];
 
 typedef struct {
     const char *profile;
@@ -207,6 +234,9 @@ static void ensure_runtime_state(void) {
     if (s_network_report_mutex == NULL) {
         s_network_report_mutex = xSemaphoreCreateMutex();
     }
+    if (s_ip_probe_mutex == NULL) {
+        s_ip_probe_mutex = xSemaphoreCreateMutex();
+    }
 }
 
 static bool ip_cooldown_allow(const char *ip, int64_t now_us, int64_t *remaining_us) {
@@ -323,7 +353,30 @@ static void session_unregister(telnet_session_t *session) {
 static void session_record_event(telnet_session_t *session, char kind, const char *data, size_t len) {
     char *next;
 
-    if (session == NULL || data == NULL || len == 0 || session->cast_truncated) {
+    if (session == NULL || data == NULL || len == 0) {
+        return;
+    }
+
+    // Wire byte counts + response-time pairs (hub protocol §3.4.8/§3.4.10).
+    // Counted before any truncation/cap so the totals reflect what crossed
+    // the socket, not what we managed to keep in the events array.
+    int64_t now_us = esp_timer_get_time();
+    if (kind == 'i') {
+        session->bytes_in += len;
+        session->last_input_us = now_us;
+    } else if (kind == 'o') {
+        session->bytes_out += len;
+        if (session->last_input_us > 0) {
+            int64_t delta_us = now_us - session->last_input_us;
+            if (delta_us >= 0 && delta_us < 60LL * 1000000LL) {
+                session->response_sum_ms += (uint64_t)(delta_us / 1000);
+                session->response_pairs++;
+            }
+            session->last_input_us = 0;
+        }
+    }
+
+    if (session->cast_truncated) {
         return;
     }
 
@@ -867,6 +920,40 @@ static cJSON *build_attack_report_json(const telnet_session_t *session, uint32_t
         }
     }
 
+    // Hub protocol §3.4.8..§3.4.11 — emit each field only when populated.
+    // The hub treats missing fields as "not measured" and keeps the row.
+    if (session->bytes_in > 0 || session->bytes_out > 0) {
+        cJSON *bytes = cJSON_AddObjectToObject(attack, "bytes");
+        if (bytes != NULL) {
+            if (session->bytes_in  > 0) cJSON_AddNumberToObject(bytes, "rx", (double)session->bytes_in);
+            if (session->bytes_out > 0) cJSON_AddNumberToObject(bytes, "tx", (double)session->bytes_out);
+        }
+    }
+    if (session->client_banner[0] != '\0') {
+        cJSON *fp = cJSON_AddObjectToObject(attack, "fingerprint");
+        if (fp != NULL) {
+            cJSON_AddStringToObject(fp, "client_banner", session->client_banner);
+        }
+    }
+    if (session->response_pairs > 0) {
+        cJSON *timing = cJSON_AddObjectToObject(attack, "timing");
+        if (timing != NULL) {
+            uint64_t avg = session->response_sum_ms / session->response_pairs;
+            cJSON_AddNumberToObject(timing, "response_ms_avg", (double)avg);
+        }
+    }
+    if (session->connect_count > 0) {
+        cJSON_AddNumberToObject(attack, "connect_count", (double)session->connect_count);
+    }
+    if (session->cve_ref_count > 0) {
+        cJSON *cves = cJSON_AddArrayToObject(attack, "cve_refs");
+        if (cves != NULL) {
+            for (size_t i = 0; i < session->cve_ref_count; i++) {
+                cJSON_AddItemToArray(cves, cJSON_CreateString(session->cve_refs[i]));
+            }
+        }
+    }
+
     return root;
 }
 
@@ -962,7 +1049,98 @@ static void free_session(telnet_session_t *session) {
     for (size_t i = 0; i < session->command_count; i++) {
         free(session->commands[i]);
     }
+    for (size_t i = 0; i < session->cve_ref_count; i++) {
+        free(session->cve_refs[i]);
+    }
     free(session);
+}
+
+// Hub protocol §3.4.11 — extract CVE-YYYY-N…N from `text` and append each
+// unique match to session->cve_refs (capped at 8 to keep heap flat).
+static void session_extract_cves(telnet_session_t *session, const char *text) {
+    if (session == NULL || text == NULL) return;
+    size_t n = strlen(text);
+    for (size_t i = 0; i + 8 <= n; i++) {
+        if ((text[i] != 'C' && text[i] != 'c') ||
+            (text[i+1] != 'V' && text[i+1] != 'v') ||
+            (text[i+2] != 'E' && text[i+2] != 'e') ||
+             text[i+3] != '-') continue;
+        if (i > 0) {
+            char prev = text[i-1];
+            if ((prev >= '0' && prev <= '9') ||
+                (prev >= 'A' && prev <= 'Z') ||
+                (prev >= 'a' && prev <= 'z') ||
+                 prev == '_') continue;
+        }
+        size_t p = i + 4;
+        if (p + 5 > n) break;
+        bool y_ok = true;
+        for (int k = 0; k < 4; k++) {
+            if (text[p+k] < '0' || text[p+k] > '9') { y_ok = false; break; }
+        }
+        if (!y_ok) continue;
+        p += 4;
+        if (text[p] != '-') continue;
+        p += 1;
+        size_t tail_start = p;
+        while (p < n && text[p] >= '0' && text[p] <= '9') p++;
+        size_t tail_len = p - tail_start;
+        if (tail_len < 4 || tail_len > 7) continue;
+        char id[24];
+        int wn = snprintf(id, sizeof(id), "CVE-%c%c%c%c-%.*s",
+                          text[i+4], text[i+5], text[i+6], text[i+7],
+                          (int)tail_len, &text[tail_start]);
+        if (wn <= 0 || wn >= (int)sizeof(id)) { i = p - 1; continue; }
+        // Upper-case canonical (year + tail are already digits).
+        bool dup = false;
+        for (size_t k = 0; k < session->cve_ref_count; k++) {
+            if (strcmp(session->cve_refs[k], id) == 0) { dup = true; break; }
+        }
+        if (!dup && session->cve_ref_count < (sizeof(session->cve_refs) / sizeof(session->cve_refs[0]))) {
+            session->cve_refs[session->cve_ref_count] = strdup(id);
+            if (session->cve_refs[session->cve_ref_count] != NULL) {
+                session->cve_ref_count++;
+            }
+        }
+        i = p - 1;
+    }
+}
+
+// Per-IP probe count: bumped when the cooldown gate rejects an accept,
+// drained when the next session for that IP finalizes.
+static void probe_count_bump(const char *ip) {
+    if (s_ip_probe_mutex == NULL || ip == NULL || ip[0] == '\0') return;
+    if (xSemaphoreTake(s_ip_probe_mutex, portMAX_DELAY) != pdTRUE) return;
+    int free_slot = -1;
+    for (int i = 0; i < IP_PROBE_ENTRIES; i++) {
+        if (s_ip_probes[i].ip[0] == '\0') { if (free_slot < 0) free_slot = i; continue; }
+        if (strcmp(s_ip_probes[i].ip, ip) == 0) {
+            s_ip_probes[i].probes++;
+            xSemaphoreGive(s_ip_probe_mutex);
+            return;
+        }
+    }
+    if (free_slot >= 0) {
+        snprintf(s_ip_probes[free_slot].ip, sizeof(s_ip_probes[free_slot].ip), "%s", ip);
+        s_ip_probes[free_slot].probes = 1;
+    }
+    xSemaphoreGive(s_ip_probe_mutex);
+}
+
+static uint32_t probe_count_consume(const char *ip) {
+    if (s_ip_probe_mutex == NULL || ip == NULL || ip[0] == '\0') return 0;
+    if (xSemaphoreTake(s_ip_probe_mutex, portMAX_DELAY) != pdTRUE) return 0;
+    uint32_t n = 0;
+    for (int i = 0; i < IP_PROBE_ENTRIES; i++) {
+        if (s_ip_probes[i].ip[0] != '\0' && strcmp(s_ip_probes[i].ip, ip) == 0) {
+            n = s_ip_probes[i].probes;
+            s_ip_probes[i].ip[0] = '\0';
+            s_ip_probes[i].probes = 0;
+            break;
+        }
+    }
+    xSemaphoreGive(s_ip_probe_mutex);
+    return n;
 }
 
 static void log_command(const char *cmd) {
@@ -1703,6 +1881,13 @@ cleanup:
     close(client_sock);
     session_unregister(session);
 
+    // Hub protocol §3.4 connect_count + §3.4.11 cve_refs (extracted from
+    // the command stream, deduplicated, capped at 8 entries).
+    session->connect_count = probe_count_consume(session->source_ip);
+    for (size_t i = 0; i < session->command_count; i++) {
+        session_extract_cves(session, session->commands[i]);
+    }
+
     attack_info_t info = {0};
     strncpy(info.ip, session->source_ip, sizeof(info.ip) - 1);
     info.port = session->source_port;
@@ -1795,6 +1980,7 @@ void start_telnet_server(void) {
                 ESP_LOGI(TAG, "Dropping telnet connection from %s:%d due to %ds IP cooldown (%llds remaining)",
                          session->source_ip, session->source_port, IP_COOLDOWN_SECONDS,
                          (long long)((cooldown_remaining_us + 999999LL) / 1000000LL));
+                probe_count_bump(session->source_ip);
                 free_session(session);
                 close(client_sock);
                 continue;
